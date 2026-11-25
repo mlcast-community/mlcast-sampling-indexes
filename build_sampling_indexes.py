@@ -1016,9 +1016,141 @@ def validate_index(country: str) -> None:
     print(f"PASS: {country} index validation completed")
 
 
+# ---------------------------------------------------------------------------
+# Zenodo: upload existing indexes without publishing or replacing files.
+# ---------------------------------------------------------------------------
+
+def zenodo_md5(path: Path) -> str:
+    digest = hashlib.md5(usedforsecurity=False)
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def zenodo_checksum(value: str) -> str:
+    return str(value).lower().removeprefix('md5:')
+
+
+def zenodo_request(session, base: str, method: str, url: str, **kwargs):
+    """Keep credentials on the selected Zenodo host; do not follow redirects."""
+    parsed = urlparse(url)
+    if (parsed.scheme, parsed.netloc) != ('https', urlparse(base).netloc):
+        raise ValueError('Unexpected Zenodo API URL')
+    try:
+        response = session.request(method, url, timeout=(30, 600),
+                                   allow_redirects=False, **kwargs)
+    except Exception as exc:
+        # Avoid printing request headers or token-bearing URLs.
+        raise RuntimeError(f'Zenodo {method} request failed ({type(exc).__name__}); '
+                           'check the draft before retrying') from None
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError(f'Zenodo {method} returned HTTP {response.status_code}; '
+                           'check token, permissions, quota and draft state')
+    return response.json()
+
+
+def zenodo_plan(paths: list[Path], remote_files: list[dict]) -> list[tuple[Path, str, str, int]]:
+    remote = {item['filename']: item for item in remote_files}
+    plan = []
+    for path in paths:
+        size = path.stat().st_size
+        print(f'Checking {path.name} ({size:,} bytes)', flush=True)
+        checksum = zenodo_md5(path)
+        if path.name not in remote:
+            action = 'UPLOAD'
+        else:
+            item = remote[path.name]
+            action = ('SKIP' if int(item['filesize']) == size and
+                      zenodo_checksum(item['checksum']) == checksum else 'CONFLICT')
+        print(f'{action}: {path.name} md5:{checksum}', flush=True)
+        plan.append((path, action, checksum, size))
+    if any(action == 'CONFLICT' for _, action, _, _ in plan):
+        raise RuntimeError('Existing remote file differs; no files uploaded. '
+                           'Review the draft manually; never overwrite published files.')
+    return plan
+
+
+def upload_indexes(args: argparse.Namespace) -> None:
+    """Plan or stream selected indexes into an explicitly selected draft."""
+    import requests
+    from urllib.parse import quote
+
+    if args.zenodo_create_draft and not args.apply:
+        raise ValueError('--zenodo-create-draft requires --apply (creates a remote draft)')
+    if not args.zenodo_create_draft and args.zenodo_deposition_id is None:
+        raise ValueError('Specify --zenodo-deposition-id or --zenodo-create-draft')
+    if args.zenodo_deposition_id is not None and args.zenodo_deposition_id <= 0:
+        raise ValueError('Deposition ID must be positive')
+    base = ('https://zenodo.org' if args.zenodo_production else
+            'https://sandbox.zenodo.org')
+    token_name = ('ZENODO_ACCESS_TOKEN' if args.zenodo_production else
+                  'ZENODO_SANDBOX_TOKEN')
+    token = os.environ.get(token_name)
+    if not token:
+        raise EnvironmentError(f'Set {token_name} in your environment')
+    index_dir = (Path(os.environ['MLCAST_INDEX_DIR']).expanduser() if
+                 'MLCAST_INDEX_DIR' in os.environ else output_root() / 'indexes')
+    files = [index_dir / f'{country}_sampling_index.parquet'
+             for country in selected_countries(args.country)]
+    for path in files:
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f'Missing or empty index: {path}')
+        # Check the Parquet footer, not the full scientific validation.
+        pq.read_metadata(path)
+    api = base + '/api/deposit/depositions'
+    with requests.Session() as session:
+        session.headers.update({'Authorization': f'Bearer {token}',
+                                'User-Agent': 'mlcast-sampling-indexes/0.2.0'})
+        if args.zenodo_create_draft:
+            deposit = zenodo_request(session, base, 'POST', api, json={})
+            print(f"Created draft {deposit['id']} at {base}/uploads/{deposit['id']}",
+                  flush=True)
+        else:
+            deposit = zenodo_request(session, base, 'GET',
+                                     f'{api}/{args.zenodo_deposition_id}')
+        dep_id = int(deposit['id'])
+        if args.zenodo_deposition_id is not None and dep_id != args.zenodo_deposition_id:
+            raise RuntimeError('Zenodo returned an unexpected deposition ID')
+        print(f'Zenodo target: {base}, deposition {dep_id}', flush=True)
+        # Published deposits can be inspected read-only, never written to.
+        if args.apply and (deposit.get('submitted') is not False or
+                           deposit.get('state') not in ('inprogress', 'unsubmitted')):
+            raise RuntimeError('Target is not an editable unpublished draft. '
+                               'Create a new version in Zenodo if needed.')
+        remote_url = f'{api}/{dep_id}/files'
+        remote = zenodo_request(session, base, 'GET', remote_url)
+        plan = zenodo_plan(files, remote)
+        if not args.apply:
+            print('Read-only preview; no files uploaded.', flush=True)
+            return
+        bucket = deposit['links']['bucket'].rstrip('/')
+        for path, action, checksum, size in plan:
+            if action == 'SKIP':
+                continue
+            # Recheck just before writing; do not intentionally replace files.
+            current = zenodo_request(session, base, 'GET', remote_url)
+            if any(item['filename'] == path.name for item in current):
+                raise RuntimeError(f'{path.name} appeared in the draft; rerun preview')
+            if path.stat().st_size != size:
+                raise RuntimeError(f'Local file changed: {path}')
+            print(f'Uploading {path.name} ...', flush=True)
+            with path.open('rb') as stream:
+                uploaded = zenodo_request(session, base, 'PUT',
+                    f'{bucket}/{quote(path.name, safe="")}', data=stream,
+                    headers={'Content-Type': 'application/octet-stream'})
+            if (uploaded.get('key') != path.name or int(uploaded['size']) != size or
+                    zenodo_checksum(uploaded['checksum']) != checksum):
+                raise RuntimeError(f'Upload verification failed: {path.name}; '
+                                   'inspect the draft before retrying')
+            print(f'Verified: {path.name}', flush=True)
+        print(f'Finished. Review metadata and publish manually: {base}/uploads/{dep_id}',
+              flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("sources", "build", "validate"))
+    parser.add_argument("action", choices=("sources", "build", "validate", "upload"))
     parser.add_argument(
         "country", nargs="?", default="all",
         help="Country code (BE, FR, IT, DE, DK, UK) or 'all' (default)",
@@ -1037,7 +1169,22 @@ def main() -> None:
         "--source-override", action="append", default=[], metavar="COUNTRY=PATH",
         help="Override a catalog Zarr's local mirror path (repeatable)",
     )
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--zenodo-deposition-id", type=int,
+                        help="Existing Zenodo deposition ID")
+    target.add_argument("--zenodo-create-draft", action="store_true",
+                        help="Create an empty draft (requires --apply)")
+    parser.add_argument("--zenodo-production", action="store_true",
+                        help="Use zenodo.org instead of sandbox.zenodo.org")
+    parser.add_argument("--apply", action="store_true",
+                        help="Perform uploads; default is read-only preview")
     args = parser.parse_args()
+    if args.action == "upload":
+        upload_indexes(args)
+        return
+    if (args.apply or args.zenodo_create_draft or args.zenodo_deposition_id is not None
+            or args.zenodo_production):
+        parser.error("Zenodo options require the upload action")
 
     if args.action in ("sources", "build"):
         configure_sources(args)
