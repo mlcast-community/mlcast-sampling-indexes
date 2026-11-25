@@ -2,6 +2,11 @@
 
 Generate and validate Parquet sampling indexes for radar datasets listed in [`mlcast-datasets`](https://github.com/mlcast-community/mlcast-datasets). The script uses MLCast's `build-sampling-index` and `validate-sampling-index` commands, with additional preprocessing for Germany and the UK.
 
+## Precomputed sampling indexes
+
+Sampling indexes for all six countries are available on
+[Zenodo](https://doi.org/10.5281/zenodo.24535863).
+
 ## Requirements
 
 - Python with `mlcast`, `numpy`, `pyarrow`, `xarray`, `zarr` and `pyyaml`
